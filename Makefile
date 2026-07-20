@@ -1,7 +1,7 @@
 COMPOSE := docker compose
 PYTHON := python3
 VENV := .venv
-TMUX_SESSION := tg_anonymous_chat_bot
+TMUX_SESSION := loghatbaz_telegram_bot
 
 .PHONY: help env venv install \
         build up down restart logs sh \
@@ -59,15 +59,23 @@ install: venv env ## Install dependencies into .venv
 	$(VENV)/bin/pip install -r requirements.txt
 
 tmux-start: install ## Start the bot inside a persistent tmux session
-	tmux new-session -d -s $(TMUX_SESSION) '$(VENV)/bin/python -m app.main 2>&1 | tee -a storage/logs/bot.log'
+	@mkdir -p storage/logs
+	@if tmux has-session -t $(TMUX_SESSION) 2>/dev/null; then \
+		echo "tmux session '$(TMUX_SESSION)' is already running."; \
+		echo "Attach with: make tmux-attach   |   Logs: make tmux-logs   |   Restart: make tmux-restart"; \
+		exit 0; \
+	fi
+	tmux new-session -d -s $(TMUX_SESSION) '$(VENV)/bin/python main.py 2>&1 | tee -a storage/logs/bot.log'
 	@echo "Started in tmux session '$(TMUX_SESSION)'."
 	@echo "Attach with: make tmux-attach   |   Stop with: make tmux-stop"
+
+tmux-restart: tmux-stop tmux-start ## Restart the tmux bot session
 
 tmux-attach: ## Attach to the running tmux session (Ctrl+B then D to detach)
 	tmux attach -t $(TMUX_SESSION)
 
 tmux-stop: ## Stop the tmux session
-	tmux kill-session -t $(TMUX_SESSION)
+	@tmux kill-session -t $(TMUX_SESSION) 2>/dev/null || true
 
 tmux-status: ## Check whether the tmux session is running
 	@tmux list-sessions 2>/dev/null | grep $(TMUX_SESSION) || echo "Not running"
