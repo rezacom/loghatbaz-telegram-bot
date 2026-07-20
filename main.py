@@ -30,14 +30,15 @@ except ModuleNotFoundError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-WORDS_PATH = BASE_DIR / "data" / "oxford_3000.json"
+WORDS_PATH = BASE_DIR / "data" / "words.jsonl"
 DB_PATH = BASE_DIR / "bot.db"
 ENV_PATH = BASE_DIR / ".env"
-LEVELS = ("A1", "A2", "B1", "B2")
+LEVELS = ("A1", "A2", "B1", "B2", "C1")
 LEVEL_RANK = {level: index for index, level in enumerate(LEVELS)}
 LEARNED_STREAK_TARGET = 7
 LEARNED_REVIEW_CHANCE = 0.15
 PAGE_SIZE = 8
+PERSIAN_TEXT_RE = re.compile(r"[\u0600-\u06ff]")
 MEANING_STOPWORDS = {
     "از",
     "به",
@@ -62,9 +63,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def expand_compact_word(row: dict) -> dict:
+    if "w" not in row:
+        return row
+    level = row.get("l", "A1")
+    return {
+        "id": row["i"],
+        "word": row["w"],
+        "meaning_fa": row.get("m", ""),
+        "example": row.get("e", ""),
+        "levels": [level],
+        "primary_level": level,
+    }
+
+
 def load_words(path: Path = WORDS_PATH) -> list[dict]:
     with path.open("r", encoding="utf-8") as file:
-        words = json.load(file)
+        if path.suffix == ".jsonl":
+            words = [
+                expand_compact_word(json.loads(line))
+                for line in file
+                if line.strip()
+            ]
+        else:
+            words = json.load(file)
     if not words:
         raise RuntimeError("Vocabulary file is empty.")
 
@@ -76,13 +98,29 @@ def load_words(path: Path = WORDS_PATH) -> list[dict]:
 
 def make_example(word: str) -> str:
     clean_word = word.split("(")[0].strip()
-    return f"I learned {clean_word} today."
+    return f"I learned the word {clean_word} today. / من امروز کلمه «{clean_word}» را یاد گرفتم."
+
+
+def example_has_persian_translation(example: str) -> bool:
+    if " / " not in example:
+        return False
+    _, translation = example.split(" / ", 1)
+    return bool(PERSIAN_TEXT_RE.search(translation)) and "?" not in translation
+
+
+def has_persian_meaning(meaning: str) -> bool:
+    return bool(meaning) and "?" not in meaning and bool(PERSIAN_TEXT_RE.search(meaning))
 
 
 WORDS = load_words()
 WORDS_BY_ID = {word["id"]: word for word in WORDS}
 WORDS_BY_LEVEL = {
     level: [word for word in WORDS if level in word["levels"]] for level in LEVELS
+}
+TRAINABLE_WORDS = [word for word in WORDS if has_persian_meaning(word.get("meaning_fa", ""))]
+TRAINABLE_WORD_IDS = {word["id"] for word in TRAINABLE_WORDS}
+TRAINABLE_WORDS_BY_LEVEL = {
+    level: [word for word in TRAINABLE_WORDS if level in word["levels"]] for level in LEVELS
 }
 
 
@@ -380,7 +418,8 @@ class ProgressStore:
         for row in status_rows:
             totals[row["status"]] = row["total"]
         totals["today_learned"] = today_row["learned_count"] if today_row else 0
-        totals["available"] = len(WORDS) - totals["hidden"]
+        hidden_trainable = len(self.hidden_ids(user_id) & TRAINABLE_WORD_IDS)
+        totals["available"] = len(TRAINABLE_WORDS) - hidden_trainable
         return totals
 
     def admin_stats(self) -> dict:
@@ -538,7 +577,7 @@ def get_candidate_words(user_id: int) -> tuple[list[dict], list[dict]]:
     learned = STORE.learned_ids(user_id)
     allowed = [
         word
-        for word in WORDS
+        for word in TRAINABLE_WORDS
         if word["id"] not in hidden and level_allowed(word, min_level)
     ]
     learned_words = [word for word in allowed if word["id"] in learned]
@@ -608,7 +647,7 @@ def meanings_too_similar(first: str, second: str) -> bool:
 def unique_meaning_pool(entry: dict, correct_answer: str) -> list[dict]:
     pool = []
     used = {normalize_meaning(correct_answer)}
-    for word in WORDS:
+    for word in TRAINABLE_WORDS:
         answer = word_answer(word)
         key = normalize_meaning(answer)
         if word["id"] == entry["id"] or key in used or meanings_too_similar(correct_answer, answer):
@@ -738,7 +777,8 @@ async def placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start_placement(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     questions = []
     for level in LEVELS:
-        questions.extend(random.sample(WORDS_BY_LEVEL[level], 2))
+        candidates = TRAINABLE_WORDS_BY_LEVEL[level]
+        questions.extend(random.sample(candidates, min(2, len(candidates))))
     random.shuffle(questions)
     context.user_data["placement"] = {
         "ids": [word["id"] for word in questions],
@@ -770,7 +810,9 @@ def placement_level(score: int) -> str:
         return "A2"
     if score <= 6:
         return "B1"
-    return "B2"
+    if score <= 8:
+        return "B2"
+    return "C1"
 
 
 async def finish_placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -811,7 +853,7 @@ def list_word_ids(user_id: int, list_name: str) -> list[int]:
     explicit_learning = set(STORE.word_ids_by_status(user_id, "learning"))
     ids = [
         word["id"]
-        for word in WORDS
+        for word in TRAINABLE_WORDS
         if word["id"] not in hidden
         and word["id"] not in learned
         and level_allowed(word, settings["min_level"])
@@ -914,7 +956,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"آموخته‌شده: {totals['statuses']['learned']}\n"
         f"حذف‌شده از نمایش: {totals['statuses']['hidden']}\n"
         f"توزیع سطح کاربران: {level_lines}\n"
-        f"تعداد کلمات دیتابیس: {len(WORDS)}"
+        f"تعداد کل کلمات دیتابیس: {len(WORDS)}\n"
+        f"کلمات قابل تمرین: {len(TRAINABLE_WORDS)}"
     )
 
 
@@ -1122,11 +1165,23 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def self_check() -> None:
     counts = Counter(word["primary_level"] for word in WORDS)
     missing_examples = [word["word"] for word in WORDS if len((word.get("example") or "").split()) < 3]
+    words_without_persian_meaning = [
+        word["word"]
+        for word in WORDS
+        if not has_persian_meaning(word.get("meaning_fa", ""))
+    ]
+    examples_without_translation = [
+        word["word"]
+        for word in WORDS
+        if not example_has_persian_translation(word.get("example") or "")
+    ]
     print(f"Loaded {len(WORDS)} Oxford entries from {WORDS_PATH}")
     for level in LEVELS:
         print(f"{level}: {counts[level]}")
-    print(f"Words without Persian meaning: {sum(1 for word in WORDS if not word.get('meaning_fa'))}")
+    print(f"Trainable words: {len(TRAINABLE_WORDS)}")
+    print(f"Words without Persian meaning: {len(words_without_persian_meaning)}")
     print(f"Examples shorter than 3 words: {len(missing_examples)}")
+    print(f"Examples without Persian translation: {len(examples_without_translation)}")
 
 
 def build_application(token: str) -> Application:
@@ -1156,7 +1211,7 @@ def build_application(token: str) -> Application:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Telegram vocabulary bot for Oxford 3000.")
+    parser = argparse.ArgumentParser(description="Telegram vocabulary bot for Oxford word lists.")
     parser.add_argument("--check", action="store_true", help="Validate local vocabulary data and exit.")
     return parser.parse_args()
 
