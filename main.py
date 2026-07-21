@@ -36,10 +36,20 @@ ENV_PATH = BASE_DIR / ".env"
 LEVELS = ("A1", "A2", "B1", "B2", "C1")
 LEVEL_RANK = {level: index for index, level in enumerate(LEVELS)}
 LEARNED_STREAK_TARGET = 7
-LEARNED_REVIEW_CHANCE = 0.15
 PAGE_SIZE = 8
 DAILY_REMINDER_INTERVAL_SECONDS = 60
-DAILY_REMINDER_TEXT = "سلام، امروز تمرین یادت رفته لغت باز منتظرته.📖"
+DAILY_REMINDER_TEXT = (
+    "\u0633\u0644\u0627\u0645 \u0627\u0645\u0631\u0648\u0632 "
+    "\u062a\u0645\u0631\u06cc\u0646 \u06cc\u0627\u062f\u062a "
+    "\u0631\u0641\u062a\u0647 \u0644\u063a\u062a \u0628\u0627\u0632 "
+    "\u0645\u0646\u062a\u0638\u0631\u062a\u0647"
+)
+LOWER_LEVEL_REVIEW_CHANCE = 0.12
+LOWER_LEVEL_WRONG_LIMIT = 5
+PLACEMENT_LEVELS = ("A2", "B1", "B2", "C1")
+PLACEMENT_QUESTIONS_PER_LEVEL = 5
+PLACEMENT_TIMEOUT_SECONDS = 5
+TEMP_RESULT_SECONDS = 3
 PERSIAN_TEXT_RE = re.compile(r"[\u0600-\u06ff]")
 MEANING_STOPWORDS = {
     "از",
@@ -171,6 +181,7 @@ class ProgressStore:
                     reminder_time TEXT,
                     last_activity_day TEXT,
                     last_reminder_day TEXT,
+                    lower_level_wrong_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -211,6 +222,7 @@ class ProgressStore:
                 "reminder_time": "ALTER TABLE user_settings ADD COLUMN reminder_time TEXT",
                 "last_activity_day": "ALTER TABLE user_settings ADD COLUMN last_activity_day TEXT",
                 "last_reminder_day": "ALTER TABLE user_settings ADD COLUMN last_reminder_day TEXT",
+                "lower_level_wrong_count": "ALTER TABLE user_settings ADD COLUMN lower_level_wrong_count INTEGER NOT NULL DEFAULT 0",
             }
             for column, sql in setting_migrations.items():
                 if column not in setting_columns:
@@ -334,10 +346,69 @@ class ProgressStore:
                     min_level = excluded.min_level,
                     placement_offered = 1,
                     placement_done = excluded.placement_done,
+                    lower_level_wrong_count = 0,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (user_id, min_level, int(placement_done)),
             )
+
+    def register_lower_level_wrong(self, user_id: int, word_level: str) -> str | None:
+        settings = self.ensure_user(user_id)
+        current_level = settings["min_level"]
+        if LEVEL_RANK[word_level] >= LEVEL_RANK[current_level]:
+            return None
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT lower_level_wrong_count
+                FROM user_settings
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            wrong_count = (row["lower_level_wrong_count"] if row else 0) + 1
+            if wrong_count > LOWER_LEVEL_WRONG_LIMIT and LEVEL_RANK[current_level] > 0:
+                new_level = LEVELS[LEVEL_RANK[current_level] - 1]
+                connection.execute(
+                    """
+                    UPDATE user_settings
+                    SET min_level = ?, lower_level_wrong_count = 0, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                    """,
+                    (new_level, user_id),
+                )
+                return new_level
+
+            connection.execute(
+                """
+                UPDATE user_settings
+                SET lower_level_wrong_count = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (wrong_count, user_id),
+            )
+        return None
+
+    def advance_if_level_complete(self, user_id: int) -> str | None:
+        settings = self.ensure_user(user_id)
+        current_level = settings["min_level"]
+        current_rank = LEVEL_RANK[current_level]
+        if current_rank >= len(LEVELS) - 1:
+            return None
+
+        hidden = self.hidden_ids(user_id)
+        learned = self.learned_ids(user_id)
+        current_word_ids = {
+            word["id"]
+            for word in TRAINABLE_WORDS
+            if word["primary_level"] == current_level and word["id"] not in hidden
+        }
+        if not current_word_ids or current_word_ids <= learned:
+            new_level = LEVELS[current_rank + 1]
+            self.set_min_level(user_id, new_level, placement_done=bool(settings["placement_done"]))
+            return new_level
+        return None
 
     def progress_for(self, user_id: int, word_id: int) -> sqlite3.Row | None:
         with self.connect() as connection:
@@ -486,6 +557,7 @@ class ProgressStore:
                     min_level = 'A1',
                     placement_offered = 0,
                     placement_done = 0,
+                    lower_level_wrong_count = 0,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (user_id,),
@@ -660,32 +732,41 @@ def format_word(entry: dict) -> str:
 
 
 def level_allowed(word: dict, min_level: str) -> bool:
-    return LEVEL_RANK[word["primary_level"]] >= LEVEL_RANK[min_level]
+    return word["primary_level"] == min_level
 
 
 def get_candidate_words(user_id: int) -> tuple[list[dict], list[dict]]:
     settings = STORE.ensure_user(user_id)
-    min_level = settings["min_level"]
+    current_level = settings["min_level"]
     hidden = STORE.hidden_ids(user_id)
     learned = STORE.learned_ids(user_id)
-    allowed = [
+    explicit_learning = set(STORE.word_ids_by_status(user_id, "learning"))
+    current_level_words = [
         word
         for word in TRAINABLE_WORDS
-        if word["id"] not in hidden and level_allowed(word, min_level)
+        if word["id"] not in hidden and word["primary_level"] == current_level
     ]
-    learned_words = [word for word in allowed if word["id"] in learned]
-    learning_words = [word for word in allowed if word["id"] not in learned]
-    return learning_words, learned_words
+    lower_review_words = [
+        word
+        for word in TRAINABLE_WORDS
+        if word["id"] not in hidden
+        and (word["id"] in learned or word["id"] in explicit_learning)
+        and LEVEL_RANK[word["primary_level"]] < LEVEL_RANK[current_level]
+    ]
+    learning_words = [word for word in current_level_words if word["id"] not in learned]
+    learning_words.sort(key=lambda word: word["id"])
+    return learning_words, lower_review_words
 
 
 def pick_study_word(user_id: int) -> dict | None:
-    learning_words, learned_words = get_candidate_words(user_id)
-    if learned_words and (not learning_words or random.random() < LEARNED_REVIEW_CHANCE):
-        return random.choice(learned_words)
+    STORE.advance_if_level_complete(user_id)
+    learning_words, lower_review_words = get_candidate_words(user_id)
+    if lower_review_words and random.random() < LOWER_LEVEL_REVIEW_CHANCE:
+        return random.choice(lower_review_words)
     if learning_words:
-        return random.choice(learning_words)
-    if learned_words:
-        return random.choice(learned_words)
+        return learning_words[0]
+    if lower_review_words:
+        return random.choice(lower_review_words)
     return None
 
 
@@ -781,11 +862,20 @@ def study_keyboard(entry: dict, options: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def placement_keyboard(entry: dict) -> InlineKeyboardMarkup:
+def placement_keyboard(entry: dict, question_no: int | None = None) -> InlineKeyboardMarkup:
     choices = build_options(entry)
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(word_answer(choice), callback_data=f"placement_answer:{entry['id']}:{choice['id']}")]
+            [
+                InlineKeyboardButton(
+                    word_answer(choice),
+                    callback_data=(
+                        f"placement_answer:{entry['id']}:{choice['id']}:{question_no}"
+                        if question_no is not None
+                        else f"placement_answer:{entry['id']}:{choice['id']}"
+                    ),
+                )
+            ]
             for choice in choices
         ]
     )
@@ -800,7 +890,7 @@ async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"کلمات آموخته‌شده امروز: {stats['today_learned']}\n"
         f"کل کلمات آموخته‌شده: {stats['learned']}\n"
         f"کلمات در حال یادگیری: {stats['learning']}\n"
-        f"سطح فعلی تمرین: {settings['min_level']} به بالا",
+        f"سطح فعلی تمرین: {settings['min_level']}",
         reply_markup=main_keyboard(),
     )
 
@@ -861,62 +951,123 @@ async def study(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start_placement(update.effective_user.id, context)
     await update.message.reply_text(
-        "آزمون تعیین سطح شروع شد. سطح درست هر کلمه را انتخاب کن.",
+        "آزمون تعیین سطح شروع شد. معنی درست هر کلمه را انتخاب کن.",
         reply_markup=main_keyboard(),
     )
-    await send_placement_question(update, context)
+    await send_placement_question_to_chat(update.effective_user.id, update.effective_chat.id, context)
 
 
 async def start_placement(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cancel_placement_timeout(context, user_id)
     questions = []
-    for level in LEVELS:
+    for level in PLACEMENT_LEVELS:
         candidates = TRAINABLE_WORDS_BY_LEVEL[level]
-        questions.extend(random.sample(candidates, min(2, len(candidates))))
-    random.shuffle(questions)
+        picked = random.sample(candidates, min(PLACEMENT_QUESTIONS_PER_LEVEL, len(candidates)))
+        picked.sort(key=lambda word: word["id"])
+        questions.extend(picked)
     context.user_data["placement"] = {
         "ids": [word["id"] for word in questions],
         "index": 0,
         "correct": 0,
+        "correct_by_level": {level: 0 for level in PLACEMENT_LEVELS},
     }
 
 
-async def send_placement_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = context.user_data.get("placement")
+def placement_timeout_job_name(user_id: int) -> str:
+    return f"placement-timeout:{user_id}"
+
+
+def cancel_placement_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    if not context.job_queue:
+        return
+    for job in context.job_queue.get_jobs_by_name(placement_timeout_job_name(user_id)):
+        job.schedule_removal()
+
+
+async def send_placement_question_to_chat(
+    user_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    state = context.application.user_data.get(user_id, {}).get("placement")
     if not state:
-        await placement(update, context)
         return
     if state["index"] >= len(state["ids"]):
-        await finish_placement(update, context)
+        await finish_placement_for_chat(user_id, chat_id, context)
         return
     entry = WORDS_BY_ID[state["ids"][state["index"]]]
-    target = update.message or update.callback_query.message
-    await target.reply_text(
-        f"سوال {state['index'] + 1}/{len(state['ids'])}\n\nمعنی این کلمه چیست؟\n{entry['word']}",
-        reply_markup=placement_keyboard(entry),
+    question_no = state["index"] + 1
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"سوال {state['index'] + 1}/{len(state['ids'])}\n\nمعنی این کلمه چیست؟\n{entry['word']}",
+        reply_markup=placement_keyboard(entry, question_no),
     )
+    state["message_id"] = message.message_id
+    if context.job_queue:
+        context.job_queue.run_once(
+            placement_question_timeout,
+            when=PLACEMENT_TIMEOUT_SECONDS,
+            data={
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "message_id": message.message_id,
+                "question_no": question_no,
+            },
+            name=placement_timeout_job_name(user_id),
+        )
 
 
-def placement_level(score: int) -> str:
-    if score <= 2:
+async def placement_question_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    user_id = data["user_id"]
+    chat_id = data["chat_id"]
+    state = context.application.user_data.get(user_id, {}).get("placement")
+    if not state or state["index"] + 1 != data["question_no"]:
+        return
+
+    entry = WORDS_BY_ID[state["ids"][state["index"]]]
+    state["index"] += 1
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=data["message_id"],
+        text=f"⏱ زمان تمام شد.\n{entry['word']}\nمعنی درست: {word_answer(entry)}",
+    )
+    context.application.create_task(
+        delete_message_by_id(context.bot, chat_id, data["message_id"], TEMP_RESULT_SECONDS)
+    )
+    await send_placement_question_to_chat(user_id, chat_id, context)
+
+
+def placement_level(correct_by_level: dict[str, int]) -> str:
+    if correct_by_level.get("A2", 0) < 3:
         return "A1"
-    if score <= 4:
+    if correct_by_level.get("B1", 0) < 3:
         return "A2"
-    if score <= 6:
+    if correct_by_level.get("B2", 0) < 3:
         return "B1"
-    if score <= 8:
+    if correct_by_level.get("C1", 0) < 3:
         return "B2"
     return "C1"
 
 
-async def finish_placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = context.user_data.pop("placement", None)
-    score = state["correct"] if state else 0
-    level = placement_level(score)
-    STORE.set_min_level(update.effective_user.id, level, placement_done=True)
-    target = update.message or update.callback_query.message
-    await target.reply_text(
+async def finish_placement_for_chat(
+    user_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    cancel_placement_timeout(context, user_id)
+    state = context.application.user_data.get(user_id, {}).pop("placement", None)
+    correct_by_level = state["correct_by_level"] if state else {}
+    score = sum(correct_by_level.values())
+    level = placement_level(correct_by_level)
+    STORE.set_min_level(user_id, level, placement_done=True)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
         f"نتیجه آزمون تعیین سطح: {level}\n"
-        f"از این به بعد کلمات سطح {level} به بالا بیشتر نمایش داده می‌شوند.",
+        f"امتیاز: {score}/20\n"
+        f"از این به بعد کلمات سطح {level} نمایش داده می‌شوند."
+        ),
         reply_markup=main_keyboard(),
     )
 
@@ -949,7 +1100,7 @@ def list_word_ids(user_id: int, list_name: str) -> list[int]:
         for word in TRAINABLE_WORDS
         if word["id"] not in hidden
         and word["id"] not in learned
-        and level_allowed(word, settings["min_level"])
+        and (level_allowed(word, settings["min_level"]) or word["id"] in explicit_learning)
     ]
     ids.sort(key=lambda word_id: (word_id not in explicit_learning, word_id))
     return ids
@@ -1054,10 +1205,18 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def delete_message_after(message, seconds: int = 2) -> None:
+async def delete_message_after(message, seconds: int = TEMP_RESULT_SECONDS) -> None:
     await asyncio.sleep(seconds)
     try:
         await message.delete()
+    except Exception as exc:
+        logger.debug("Could not delete temporary message: %s", exc)
+
+
+async def delete_message_by_id(bot, chat_id: int, message_id: int, seconds: int = TEMP_RESULT_SECONDS) -> None:
+    await asyncio.sleep(seconds)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as exc:
         logger.debug("Could not delete temporary message: %s", exc)
 
@@ -1145,6 +1304,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         result = STORE.answer(user_id, word_id, is_correct)
         entry = WORDS_BY_ID[word_id]
         selected = WORDS_BY_ID[selected_id]
+        downgraded_level = None
         if is_correct:
             prefix = "✅ درست بود."
             if result["learned_now"]:
@@ -1152,11 +1312,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 prefix += f"\nپیشرفت: {result['streak']}/{LEARNED_STREAK_TARGET}"
         else:
+            downgraded_level = STORE.register_lower_level_wrong(user_id, entry["primary_level"])
             prefix = (
                 "❌ اشتباه بود.\n"
                 "پیشرفت این کلمه ریست شد و دوباره وارد لیست یادگیری شد.\n"
                 f"انتخاب تو: {word_answer(selected)}"
             )
+            if downgraded_level:
+                prefix += f"\nسطح تمرین به {downgraded_level} کاهش پیدا کرد."
         await query.message.edit_text(f"{prefix}\n\n{format_word(entry)}")
         asyncio.create_task(delete_message_after(query.message))
         await send_study_card(update, context)
@@ -1192,7 +1355,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "placement_start":
         await start_placement(user_id, context)
         await query.message.reply_text("آزمون تعیین سطح شروع شد.")
-        await send_placement_question(update, context)
+        await send_placement_question_to_chat(user_id, query.message.chat_id, context)
         return
 
     if action == "placement_skip":
@@ -1203,15 +1366,22 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "placement_answer":
         word_id = int(parts[1])
         selected_id = int(parts[2])
+        question_no = int(parts[3]) if len(parts) > 3 else None
         entry = WORDS_BY_ID[word_id]
         selected = WORDS_BY_ID[selected_id]
         state = context.user_data.get("placement")
         if not state:
             await query.message.reply_text("آزمون فعال نیست. دوباره /placement را بزن.")
             return
+        if question_no is not None and state["index"] + 1 != question_no:
+            return
+        if state["ids"][state["index"]] != word_id:
+            return
+        cancel_placement_timeout(context, user_id)
         is_correct = selected_id == word_id
         if is_correct:
             state["correct"] += 1
+            state["correct_by_level"][entry["primary_level"]] += 1
         state["index"] += 1
         await query.message.edit_text(
             f"{'✅' if is_correct else '❌'} {entry['word']}\n"
@@ -1219,7 +1389,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"انتخاب تو: {word_answer(selected)}"
         )
         asyncio.create_task(delete_message_after(query.message))
-        await send_placement_question(update, context)
+        await send_placement_question_to_chat(user_id, query.message.chat_id, context)
         return
 
     if action == "list":
