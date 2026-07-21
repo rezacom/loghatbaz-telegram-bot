@@ -10,7 +10,7 @@ import re
 import sqlite3
 from collections import Counter
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -38,6 +38,8 @@ LEVEL_RANK = {level: index for index, level in enumerate(LEVELS)}
 LEARNED_STREAK_TARGET = 7
 LEARNED_REVIEW_CHANCE = 0.15
 PAGE_SIZE = 8
+DAILY_REMINDER_INTERVAL_SECONDS = 60
+DAILY_REMINDER_TEXT = "سلام امروز تمرین یادت رفته لغت باز منتظرته"
 PERSIAN_TEXT_RE = re.compile(r"[\u0600-\u06ff]")
 MEANING_STOPWORDS = {
     "از",
@@ -165,6 +167,10 @@ class ProgressStore:
                     min_level TEXT NOT NULL DEFAULT 'A1',
                     placement_offered INTEGER NOT NULL DEFAULT 0,
                     placement_done INTEGER NOT NULL DEFAULT 0,
+                    first_started_at TEXT,
+                    reminder_time TEXT,
+                    last_activity_day TEXT,
+                    last_reminder_day TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -195,6 +201,28 @@ class ProgressStore:
             for column, sql in migrations.items():
                 if column not in columns:
                     connection.execute(sql)
+
+            setting_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(user_settings)").fetchall()
+            }
+            setting_migrations = {
+                "first_started_at": "ALTER TABLE user_settings ADD COLUMN first_started_at TEXT",
+                "reminder_time": "ALTER TABLE user_settings ADD COLUMN reminder_time TEXT",
+                "last_activity_day": "ALTER TABLE user_settings ADD COLUMN last_activity_day TEXT",
+                "last_reminder_day": "ALTER TABLE user_settings ADD COLUMN last_reminder_day TEXT",
+            }
+            for column, sql in setting_migrations.items():
+                if column not in setting_columns:
+                    connection.execute(sql)
+            connection.execute(
+                """
+                UPDATE user_settings
+                SET
+                    first_started_at = COALESCE(first_started_at, CURRENT_TIMESTAMP),
+                    reminder_time = COALESCE(reminder_time, strftime('%H:%M', 'now', 'localtime'))
+                """
+            )
             connection.execute(
                 """
                 UPDATE word_progress
@@ -208,15 +236,80 @@ class ProgressStore:
             )
 
     def ensure_user(self, user_id: int) -> sqlite3.Row:
+        now = datetime.now()
         with self.connect() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)",
-                (user_id,),
+                """
+                INSERT OR IGNORE INTO user_settings (
+                    user_id, first_started_at, reminder_time, last_activity_day
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    now.isoformat(timespec="seconds"),
+                    now.strftime("%H:%M"),
+                    now.date().isoformat(),
+                ),
             )
             return connection.execute(
                 "SELECT * FROM user_settings WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
+
+    def record_activity(self, user_id: int) -> None:
+        now = datetime.now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO user_settings (
+                    user_id, first_started_at, reminder_time, last_activity_day
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    now.isoformat(timespec="seconds"),
+                    now.strftime("%H:%M"),
+                    now.date().isoformat(),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE user_settings
+                SET last_activity_day = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (now.date().isoformat(), user_id),
+            )
+
+    def users_due_for_reminder(self, now: datetime) -> list[int]:
+        today = now.date().isoformat()
+        current_time = now.strftime("%H:%M")
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id
+                FROM user_settings
+                WHERE reminder_time IS NOT NULL
+                  AND reminder_time <= ?
+                  AND COALESCE(last_activity_day, '') <> ?
+                  AND COALESCE(last_reminder_day, '') <> ?
+                """,
+                (current_time, today, today),
+            ).fetchall()
+        return [row["user_id"] for row in rows]
+
+    def mark_reminder_sent(self, user_id: int, day: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE user_settings
+                SET last_reminder_day = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+                """,
+                (day, user_id),
+            )
 
     def set_placement_offered(self, user_id: int) -> None:
         with self.connect() as connection:
@@ -969,6 +1062,27 @@ async def delete_message_after(message, seconds: int = 2) -> None:
         logger.debug("Could not delete temporary message: %s", exc)
 
 
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user:
+        STORE.record_activity(update.effective_user.id)
+
+
+async def send_daily_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now()
+    today = now.date().isoformat()
+    for user_id in STORE.users_due_for_reminder(now):
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=DAILY_REMINDER_TEXT,
+                reply_markup=main_keyboard(),
+            )
+        except Exception as exc:
+            logger.warning("Could not send daily reminder to %s: %s", user_id, exc)
+            continue
+        STORE.mark_reminder_sent(user_id, today)
+
+
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     current = STORE.ensure_user(update.effective_user.id)
     await update.message.reply_text(
@@ -1195,6 +1309,18 @@ def build_application(token: str) -> Application:
         builder = builder.proxy_url(proxy_url).get_updates_proxy_url(proxy_url)
 
     application = builder.build()
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            send_daily_reminders,
+            interval=DAILY_REMINDER_INTERVAL_SECONDS,
+            first=10,
+            name="daily-practice-reminders",
+        )
+    else:
+        logger.warning("Daily reminders are disabled. Install python-telegram-bot with the job-queue extra.")
+
+    application.add_handler(MessageHandler(filters.ALL, track_activity), group=-1)
+    application.add_handler(CallbackQueryHandler(track_activity), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("study", study))
