@@ -39,7 +39,7 @@ LEARNED_STREAK_TARGET = 7
 LEARNED_REVIEW_CHANCE = 0.15
 PAGE_SIZE = 8
 DAILY_REMINDER_INTERVAL_SECONDS = 60
-DAILY_REMINDER_TEXT = "سلام امروز تمرین یادت رفته لغت باز منتظرته"
+DAILY_REMINDER_TEXT = "سلام، امروز تمرین یادت رفته لغت باز منتظرته.📖"
 PERSIAN_TEXT_RE = re.compile(r"[\u0600-\u06ff]")
 MEANING_STOPWORDS = {
     "از",
