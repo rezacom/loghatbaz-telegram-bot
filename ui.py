@@ -35,7 +35,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["شروع تمرین", "آزمون تعیین سطح"],
-            ["لیست‌ها", "آمار"],
+            ["دیکشنری و ترجمه", "لیست‌ها"],
+            ["آمار"],
             ["تنظیمات", "راهنما"],
         ],
         resize_keyboard=True,

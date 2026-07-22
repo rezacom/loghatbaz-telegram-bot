@@ -49,6 +49,7 @@ from ui import (
     word_answer,
 )
 from study import level_allowed, pick_study_word
+from translator import translate_text
 
 try:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -688,6 +689,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/stats - آمار امروز و کل\n"
         "/settings - تنظیمات و بازنشانی\n"
         "/search word - جست‌وجوی کلمه\n"
+        "/translate text - دیکشنری و ترجمه\n"
         "/myid - نمایش شناسه تلگرام برای ادمین شدن",
         reply_markup=main_keyboard(),
     )
@@ -723,7 +725,7 @@ async def placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_placement_intro(target) -> None:
     await target.reply_text(
         "آزمون دارای 20 سوال می باشد\n"
-        "برای هر سوال 5 ثانیه فرصت دارید تا پاسخ دهید",
+        "برای هر سوال 8 ثانیه فرصت دارید تا پاسخ دهید",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("شروع آزمون", callback_data="placement_begin")]]
         ),
@@ -1071,6 +1073,53 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(format_word(word) for word in results))
 
 
+def find_exact_word(text: str) -> dict | None:
+    normalized = text.strip().casefold()
+    if not normalized or any(character.isspace() for character in normalized):
+        return None
+    for word in WORDS:
+        if word["word"].casefold() == normalized:
+            return word
+    return None
+
+
+async def dictionary_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip() if context.args else update.message.text.strip()
+    if text == "دیکشنری و ترجمه" or text.startswith("/translate"):
+        await update.message.reply_text(
+            "کلمه یا جمله انگلیسی را بفرست تا معنی یا ترجمه‌اش را نمایش بدهم.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    if not text:
+        await update.message.reply_text("کلمه یا جمله را بفرست.")
+        return
+
+    exact_word = find_exact_word(text)
+    if exact_word:
+        await update.message.reply_text(
+            "دیکشنری لغت‌باز\n\n" + format_word(exact_word),
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    try:
+        result = await asyncio.to_thread(translate_text, text)
+    except Exception as exc:
+        logger.warning("Translation failed: %s", exc)
+        await update.message.reply_text(
+            "فعلا نتوانستم ترجمه کنم. چند لحظه بعد دوباره امتحان کن.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await update.message.reply_text(
+        "ترجمه پیشنهادی\n\n"
+        f"{result.translated_text}",
+        reply_markup=main_keyboard(),
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     if text == CANCEL_PLACEMENT_TEXT:
@@ -1083,13 +1132,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await lists(update, context)
     elif text == "آمار":
         await stats(update, context)
+    elif text == "دیکشنری و ترجمه":
+        await dictionary_translate(update, context)
     elif text == "تنظیمات":
         await settings(update, context)
     elif text == "راهنما":
         await help_command(update, context)
     else:
         context.args = [text]
-        await search(update, context)
+        await dictionary_translate(update, context)
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1304,6 +1355,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("search", search))
+    application.add_handler(CommandHandler("translate", dictionary_translate))
     application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CallbackQueryHandler(callbacks))
