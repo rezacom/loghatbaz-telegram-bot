@@ -840,13 +840,16 @@ async def placement_question_timeout(context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def placement_level(correct_by_level: dict[str, int]) -> str:
+    total_correct = sum(correct_by_level.values())
     if correct_by_level.get("A2", 0) < 3:
         return "A1"
     if correct_by_level.get("B1", 0) < 3:
         return "A2"
     if correct_by_level.get("B2", 0) < 3:
         return "B1"
-    if correct_by_level.get("C1", 0) < 3:
+    if total_correct < 15:
+        return "B1"
+    if total_correct < 18:
         return "B2"
     return "C1"
 
