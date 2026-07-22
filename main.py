@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 from collections import Counter
 from contextlib import contextmanager
@@ -25,6 +26,9 @@ from config import (
     PLACEMENT_LEVELS,
     PLACEMENT_QUESTIONS_PER_LEVEL,
     PLACEMENT_TIMEOUT_SECONDS,
+    RANDOM_CHAT_BUTTON_TEXT,
+    RANDOM_CHAT_CANCEL_TEXT,
+    RANDOM_CHAT_SEARCH_SECONDS,
     TEMP_RESULT_SECONDS,
     WORDS_PATH,
 )
@@ -45,6 +49,7 @@ from ui import (
     main_keyboard,
     placement_cancel_keyboard,
     placement_keyboard,
+    random_chat_cancel_keyboard,
     study_keyboard,
     word_answer,
 )
@@ -648,6 +653,10 @@ class ProgressStore:
 
 
 STORE = ProgressStore()
+WAITING_RANDOM_CHAT: dict[int, int] = {}
+ACTIVE_RANDOM_CHATS: dict[int, int] = {}
+ENGLISH_TEXT_RE = re.compile(r"[A-Za-z]")
+PERSIAN_TEXT_RE = re.compile(r"[\u0600-\u06ff]")
 
 
 async def send_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,6 +699,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/settings - تنظیمات و بازنشانی\n"
         "/search word - جست‌وجوی کلمه\n"
         "/translate text - دیکشنری و ترجمه\n"
+        "/english_chat - مکالمه انگلیسی با کاربر رندوم\n"
         "/myid - نمایش شناسه تلگرام برای ادمین شدن",
         reply_markup=main_keyboard(),
     )
@@ -725,7 +735,7 @@ async def placement(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_placement_intro(target) -> None:
     await target.reply_text(
         "آزمون دارای 20 سوال می باشد\n"
-        "برای هر سوال 8 ثانیه فرصت دارید تا پاسخ دهید",
+        f"برای هر سوال {PLACEMENT_TIMEOUT_SECONDS} ثانیه فرصت دارید تا پاسخ دهید",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("شروع آزمون", callback_data="placement_begin")]]
         ),
@@ -755,6 +765,7 @@ async def start_placement(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> N
         "index": 0,
         "correct": 0,
         "correct_by_level": {level: 0 for level in PLACEMENT_LEVELS},
+        "results": [],
     }
 
 
@@ -815,6 +826,7 @@ async def placement_question_timeout(context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     entry = WORDS_BY_ID[state["ids"][state["index"]]]
+    state["results"].append({"word_id": entry["id"], "is_correct": False})
     state["index"] += 1
     await context.bot.edit_message_text(
         chat_id=chat_id,
@@ -839,6 +851,19 @@ def placement_level(correct_by_level: dict[str, int]) -> str:
     return "C1"
 
 
+def format_placement_results(results: list[dict]) -> str:
+    if not results:
+        return ""
+    lines = ["", "نتیجه لغات آزمون:"]
+    for index, item in enumerate(results, 1):
+        entry = WORDS_BY_ID.get(item["word_id"])
+        if not entry:
+            continue
+        status = "✅ صحیح" if item["is_correct"] else "❌ اشتباه"
+        lines.append(f"{index}. {entry['word']} - {status}")
+    return "\n".join(lines)
+
+
 async def finish_placement_for_chat(
     user_id: int,
     chat_id: int,
@@ -847,6 +872,7 @@ async def finish_placement_for_chat(
     cancel_placement_timeout(context, user_id)
     state = context.application.user_data.get(user_id, {}).pop("placement", None)
     correct_by_level = state["correct_by_level"] if state else {}
+    results = state.get("results", []) if state else []
     score = sum(correct_by_level.values())
     level = placement_level(correct_by_level)
     STORE.set_min_level(user_id, level, placement_done=True)
@@ -856,6 +882,7 @@ async def finish_placement_for_chat(
         f"نتیجه آزمون تعیین سطح: {level}\n"
         f"امتیاز: {score}/20\n"
         f"از این به بعد کلمات سطح {level} نمایش داده می‌شوند."
+        f"{format_placement_results(results)}"
         ),
         reply_markup=main_keyboard(),
     )
@@ -873,6 +900,146 @@ async def cancel_placement_for_chat(
         text="آزمون لغو شد.",
         reply_markup=main_keyboard(),
     )
+
+
+def random_chat_timeout_job_name(user_id: int) -> str:
+    return f"random-chat-timeout:{user_id}"
+
+
+def cancel_random_chat_timeout(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    if not context.job_queue:
+        return
+    for job in context.job_queue.get_jobs_by_name(random_chat_timeout_job_name(user_id)):
+        job.schedule_removal()
+
+
+def is_english_chat_text(text: str) -> bool:
+    return bool(ENGLISH_TEXT_RE.search(text)) and not PERSIAN_TEXT_RE.search(text)
+
+
+async def random_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if user_id in ACTIVE_RANDOM_CHATS:
+        await update.message.reply_text(
+            "شما در حال مکالمه هستید. برای خروج دکمه لغو مکالمه را بزنید.",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
+        return
+    if user_id in WAITING_RANDOM_CHAT:
+        await update.message.reply_text(
+            "در حال جستجوی کاربر آنلاین هستم...",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
+        return
+
+    for peer_id, peer_chat_id in list(WAITING_RANDOM_CHAT.items()):
+        if peer_id == user_id:
+            continue
+        WAITING_RANDOM_CHAT.pop(peer_id, None)
+        cancel_random_chat_timeout(context, peer_id)
+        ACTIVE_RANDOM_CHATS[user_id] = peer_id
+        ACTIVE_RANDOM_CHATS[peer_id] = user_id
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="وصل شدی. فقط انگلیسی تایپ کن. برای خروج دکمه لغو مکالمه را بزن.",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
+        await context.bot.send_message(
+            chat_id=peer_chat_id,
+            text="وصل شدی. فقط انگلیسی تایپ کن. برای خروج دکمه لغو مکالمه را بزن.",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
+        return
+
+    WAITING_RANDOM_CHAT[user_id] = chat_id
+    if context.job_queue:
+        context.job_queue.run_once(
+            random_chat_search_timeout,
+            when=RANDOM_CHAT_SEARCH_SECONDS,
+            data={"user_id": user_id, "chat_id": chat_id},
+            name=random_chat_timeout_job_name(user_id),
+        )
+    await update.message.reply_text(
+        "در حال جستجوی کاربر آنلاین هستم...",
+        reply_markup=random_chat_cancel_keyboard(),
+    )
+
+
+async def random_chat_search_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    user_id = data["user_id"]
+    chat_id = data["chat_id"]
+    if WAITING_RANDOM_CHAT.pop(user_id, None) is None:
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="متاسفانه کسی در این لحظه انلاین نیست",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def cancel_random_chat_for_user(
+    user_id: int,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    notify_peer: bool = True,
+) -> None:
+    cancel_random_chat_timeout(context, user_id)
+    if WAITING_RANDOM_CHAT.pop(user_id, None) is not None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="جستجوی مکالمه لغو شد.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    peer_id = ACTIVE_RANDOM_CHATS.pop(user_id, None)
+    if peer_id is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="مکالمه فعالی وجود ندارد.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    ACTIVE_RANDOM_CHATS.pop(peer_id, None)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="مکالمه تمام شد.",
+        reply_markup=main_keyboard(),
+    )
+    if notify_peer:
+        try:
+            await context.bot.send_message(
+                chat_id=peer_id,
+                text="طرف مقابل مکالمه را ترک کرد.",
+                reply_markup=main_keyboard(),
+            )
+        except Exception as exc:
+            logger.warning("Could not notify random chat peer %s: %s", peer_id, exc)
+
+
+async def relay_random_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    peer_id = ACTIVE_RANDOM_CHATS.get(user_id)
+    if peer_id is None:
+        return False
+
+    text = update.message.text.strip()
+    if not is_english_chat_text(text):
+        await update.message.reply_text(
+            "فقط انگلیسی تایپ کن. پیام فارسی یا بدون کلمه انگلیسی ارسال نمی‌شود.",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
+        return True
+
+    try:
+        await context.bot.send_message(chat_id=peer_id, text=text)
+    except Exception as exc:
+        logger.warning("Could not relay random chat message: %s", exc)
+        await cancel_random_chat_for_user(user_id, update.effective_chat.id, context, notify_peer=False)
+    return True
 
 
 async def lists(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1124,10 +1291,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     if text == CANCEL_PLACEMENT_TEXT:
         await cancel_placement_for_chat(update.effective_user.id, update.effective_chat.id, context)
+    elif text == RANDOM_CHAT_CANCEL_TEXT:
+        await cancel_random_chat_for_user(update.effective_user.id, update.effective_chat.id, context)
+    elif await relay_random_chat_message(update, context):
+        return
+    elif update.effective_user.id in WAITING_RANDOM_CHAT:
+        await update.message.reply_text(
+            "هنوز در حال جستجوی کاربر آنلاین هستم...",
+            reply_markup=random_chat_cancel_keyboard(),
+        )
     elif text == "شروع تمرین":
         await study(update, context)
     elif text == "آزمون تعیین سطح":
         await placement(update, context)
+    elif text == RANDOM_CHAT_BUTTON_TEXT:
+        await random_chat(update, context)
     elif text == "لیست‌ها":
         await lists(update, context)
     elif text == "آمار":
@@ -1238,6 +1416,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if is_correct:
             state["correct"] += 1
             state["correct_by_level"][entry["primary_level"]] += 1
+        state["results"].append({"word_id": entry["id"], "is_correct": is_correct})
         state["index"] += 1
         await query.message.edit_text(
             f"{'✅' if is_correct else '❌'} {entry['word']}\n"
@@ -1356,6 +1535,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("search", search))
     application.add_handler(CommandHandler("translate", dictionary_translate))
+    application.add_handler(CommandHandler("english_chat", random_chat))
     application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CallbackQueryHandler(callbacks))

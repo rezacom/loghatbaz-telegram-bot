@@ -4,7 +4,12 @@ import random
 import re
 from functools import lru_cache
 
-from config import CANCEL_PLACEMENT_TEXT, LEARNED_STREAK_TARGET
+from config import (
+    CANCEL_PLACEMENT_TEXT,
+    LEARNED_STREAK_TARGET,
+    RANDOM_CHAT_BUTTON_TEXT,
+    RANDOM_CHAT_CANCEL_TEXT,
+)
 from vocabulary import TRAINABLE_WORDS, make_example
 
 try:
@@ -35,8 +40,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["شروع تمرین", "آزمون تعیین سطح"],
-            ["دیکشنری و ترجمه", "لیست‌ها"],
-            ["آمار"],
+            ["دیکشنری و ترجمه", RANDOM_CHAT_BUTTON_TEXT],
+            ["لیست‌ها", "آمار"],
             ["تنظیمات", "راهنما"],
         ],
         resize_keyboard=True,
@@ -45,6 +50,10 @@ def main_keyboard() -> ReplyKeyboardMarkup:
 
 def placement_cancel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[CANCEL_PLACEMENT_TEXT]], resize_keyboard=True)
+
+
+def random_chat_cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[RANDOM_CHAT_CANCEL_TEXT]], resize_keyboard=True)
 
 
 def word_answer(entry: dict) -> str:
