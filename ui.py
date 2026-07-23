@@ -6,7 +6,9 @@ from functools import lru_cache
 
 from config import (
     CANCEL_PLACEMENT_TEXT,
+    FEEDBACK_BUTTON_TEXT,
     LEARNED_STREAK_TARGET,
+    RANDOM_CHAT_BLOCK_TEXT,
     RANDOM_CHAT_BUTTON_TEXT,
     RANDOM_CHAT_CANCEL_TEXT,
 )
@@ -42,7 +44,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
             ["شروع تمرین", "آزمون تعیین سطح"],
             ["دیکشنری و ترجمه", RANDOM_CHAT_BUTTON_TEXT],
             ["لیست‌ها", "آمار"],
-            ["تنظیمات", "راهنما"],
+            ["تنظیمات", FEEDBACK_BUTTON_TEXT],
+            ["راهنما"],
         ],
         resize_keyboard=True,
     )
@@ -53,7 +56,10 @@ def placement_cancel_keyboard() -> ReplyKeyboardMarkup:
 
 
 def random_chat_cancel_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([[RANDOM_CHAT_CANCEL_TEXT]], resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [[RANDOM_CHAT_CANCEL_TEXT], [RANDOM_CHAT_BLOCK_TEXT]],
+        resize_keyboard=True,
+    )
 
 
 def word_answer(entry: dict) -> str:

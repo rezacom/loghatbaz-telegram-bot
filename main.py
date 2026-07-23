@@ -14,6 +14,8 @@ from pathlib import Path
 
 from config import (
     CANCEL_PLACEMENT_TEXT,
+    FEEDBACK_BUTTON_TEXT,
+    FEEDBACK_USERNAME,
     DAILY_REMINDER_INTERVAL_SECONDS,
     DAILY_REMINDER_TEXT,
     DB_PATH,
@@ -27,6 +29,7 @@ from config import (
     PLACEMENT_QUESTIONS_PER_LEVEL,
     PLACEMENT_TIMEOUT_SECONDS,
     RANDOM_CHAT_BUTTON_TEXT,
+    RANDOM_CHAT_BLOCK_TEXT,
     RANDOM_CHAT_CANCEL_TEXT,
     RANDOM_CHAT_SEARCH_SECONDS,
     TEMP_RESULT_SECONDS,
@@ -135,6 +138,16 @@ class ProgressStore:
                     day TEXT NOT NULL,
                     learned_count INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_id, day)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blocked_users (
+                    user_id INTEGER NOT NULL,
+                    blocked_user_id INTEGER NOT NULL,
+                    blocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, blocked_user_id)
                 )
                 """
             )
@@ -264,6 +277,53 @@ class ProgressStore:
                 """,
                 (day, user_id),
             )
+
+    def block_user(self, user_id: int, blocked_user_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO blocked_users (user_id, blocked_user_id)
+                VALUES (?, ?)
+                """,
+                (user_id, blocked_user_id),
+            )
+
+    def unblock_user(self, user_id: int, blocked_user_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM blocked_users
+                WHERE user_id = ? AND blocked_user_id = ?
+                """,
+                (user_id, blocked_user_id),
+            )
+
+    def blocked_user_ids(self, user_id: int) -> set[int]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT blocked_user_id
+                FROM blocked_users
+                WHERE user_id = ?
+                ORDER BY blocked_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+        return {row["blocked_user_id"] for row in rows}
+
+    def is_random_chat_allowed(self, first_user_id: int, second_user_id: int) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM blocked_users
+                WHERE (user_id = ? AND blocked_user_id = ?)
+                   OR (user_id = ? AND blocked_user_id = ?)
+                LIMIT 1
+                """,
+                (first_user_id, second_user_id, second_user_id, first_user_id),
+            ).fetchone()
+        return row is None
 
     def set_placement_offered(self, user_id: int) -> None:
         with self.connect() as connection:
@@ -863,7 +923,7 @@ def format_placement_results(results: list[dict]) -> str:
         if not entry:
             continue
         status = "✅ صحیح" if item["is_correct"] else "❌ اشتباه"
-        lines.append(f"{index}. {entry['word']} - {status}")
+        lines.append(f"{index}. {entry['word']} - {word_answer(entry)} - {status}")
     return "\n".join(lines)
 
 
@@ -938,6 +998,8 @@ async def random_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     for peer_id, peer_chat_id in list(WAITING_RANDOM_CHAT.items()):
         if peer_id == user_id:
+            continue
+        if not STORE.is_random_chat_allowed(user_id, peer_id):
             continue
         WAITING_RANDOM_CHAT.pop(peer_id, None)
         cancel_random_chat_timeout(context, peer_id)
@@ -1021,6 +1083,34 @@ async def cancel_random_chat_for_user(
             )
         except Exception as exc:
             logger.warning("Could not notify random chat peer %s: %s", peer_id, exc)
+
+
+async def block_random_chat_peer(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    peer_id = ACTIVE_RANDOM_CHATS.get(user_id)
+    if peer_id is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="برای بلاک کردن باید داخل مکالمه فعال باشید.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    STORE.block_user(user_id, peer_id)
+    ACTIVE_RANDOM_CHATS.pop(user_id, None)
+    ACTIVE_RANDOM_CHATS.pop(peer_id, None)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="کاربر بلاک شد و مکالمه پایان یافت.",
+        reply_markup=main_keyboard(),
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=peer_id,
+            text="طرف مقابل مکالمه را ترک کرد.",
+            reply_markup=main_keyboard(),
+        )
+    except Exception as exc:
+        logger.warning("Could not notify blocked random chat peer %s: %s", peer_id, exc)
 
 
 async def relay_random_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1222,7 +1312,33 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             [
                 [InlineKeyboardButton("بازنشانی همه چیز", callback_data="reset_confirm")],
                 [InlineKeyboardButton("تعیین سطح دوباره", callback_data="placement_start")],
+                [InlineKeyboardButton("کاربران بلاک‌شده", callback_data="blocked_users")],
             ]
+        ),
+    )
+
+
+def render_blocked_users(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    ids = sorted(STORE.blocked_user_ids(user_id))
+    if not ids:
+        return "لیست کاربران بلاک‌شده خالی است.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("بازگشت به تنظیمات", callback_data="settings_menu")]]
+        )
+
+    lines = ["کاربران بلاک‌شده:"]
+    rows = []
+    for blocked_id in ids:
+        lines.append(f"- کاربر {blocked_id}")
+        rows.append([InlineKeyboardButton(f"حذف از بلاک: {blocked_id}", callback_data=f"unblock:{blocked_id}")])
+    rows.append([InlineKeyboardButton("بازگشت به تنظیمات", callback_data="settings_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def send_feedback_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"برای ارسال انتقادات و پیشنهادات به این آیدی پیام بده:\n@{FEEDBACK_USERNAME}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("ارسال پیام", url=f"https://t.me/{FEEDBACK_USERNAME}")]]
         ),
     )
 
@@ -1296,6 +1412,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await cancel_placement_for_chat(update.effective_user.id, update.effective_chat.id, context)
     elif text == RANDOM_CHAT_CANCEL_TEXT:
         await cancel_random_chat_for_user(update.effective_user.id, update.effective_chat.id, context)
+    elif text == RANDOM_CHAT_BLOCK_TEXT:
+        await block_random_chat_peer(update.effective_user.id, update.effective_chat.id, context)
     elif await relay_random_chat_message(update, context):
         return
     elif update.effective_user.id in WAITING_RANDOM_CHAT:
@@ -1317,6 +1435,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await dictionary_translate(update, context)
     elif text == "تنظیمات":
         await settings(update, context)
+    elif text == FEEDBACK_BUTTON_TEXT:
+        await send_feedback_link(update, context)
     elif text == "راهنما":
         await help_command(update, context)
     else:
@@ -1469,6 +1589,32 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 [
                     [InlineKeyboardButton("بله، همه چیز ریست شود", callback_data="reset_all")],
                     [InlineKeyboardButton("لغو", callback_data="settings_cancel")],
+                ]
+            ),
+        )
+        return
+
+    if action == "blocked_users":
+        text, keyboard = render_blocked_users(user_id)
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+
+    if action == "unblock":
+        blocked_id = int(parts[1])
+        STORE.unblock_user(user_id, blocked_id)
+        text, keyboard = render_blocked_users(user_id)
+        await query.edit_message_text("کاربر از بلاک خارج شد.\n\n" + text, reply_markup=keyboard)
+        return
+
+    if action == "settings_menu":
+        current = STORE.ensure_user(user_id)
+        await query.edit_message_text(
+            f"تنظیمات\n\nسطح فعلی: {current['min_level']}\nبرای بازنشانی کامل، دکمه زیر را بزن.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("بازنشانی همه چیز", callback_data="reset_confirm")],
+                    [InlineKeyboardButton("تعیین سطح دوباره", callback_data="placement_start")],
+                    [InlineKeyboardButton("کاربران بلاک‌شده", callback_data="blocked_users")],
                 ]
             ),
         )

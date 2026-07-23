@@ -29,3 +29,6 @@ CANCEL_PLACEMENT_TEXT = "لغو آزمون"
 RANDOM_CHAT_SEARCH_SECONDS = 60
 RANDOM_CHAT_BUTTON_TEXT = "مکالمه انگلیسی با کاربر رندوم"
 RANDOM_CHAT_CANCEL_TEXT = "لغو مکالمه"
+RANDOM_CHAT_BLOCK_TEXT = "بلاک کردن کاربر"
+FEEDBACK_BUTTON_TEXT = "انتقادات و پیشنهادات"
+FEEDBACK_USERNAME = "rezas1880"
